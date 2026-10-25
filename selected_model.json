@@ -1,0 +1,13 @@
+{
+  "family": "ExtraTrees",
+  "feature_profile": "basic_all_nonconstant",
+  "seed": 20260924,
+  "params": {
+    "n_estimators": 250,
+    "max_depth": 16,
+    "min_samples_leaf": 30,
+    "max_features": 0.5
+  },
+  "source_configuration_id": 86,
+  "source": "paper_code_current/reference_results/ml/search_plan.json; family winner recorded in model_selection_lock.json"
+}

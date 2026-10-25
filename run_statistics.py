@@ -27,12 +27,11 @@ MAP = {
     "bmi": "孕前BMI",
     "parity": "产次",
     "gravidity": "孕次",
-    "adverse_history": "不良孕产史",
     "PE": "子痫前期",
     "FGR": "胎儿生长受限",
     "PROM": "胎膜早破",
 }
-BASE = ["bmi", "parity", "gravidity", "adverse_history", "PE", "FGR", "PROM"]
+BASE = ["bmi", "parity", "gravidity", "PE", "FGR", "PROM"]
 
 
 class ChunkLogit(sm.Logit):
@@ -80,6 +79,61 @@ def contrast(v, beta, cov):
         ]
     )
 
+
+def cumulative_interaction_test(beta, cov, lagbasis):
+    """联合检验累计温度基系数为零，不包含阿司匹林主效应。"""
+    # 交互系数按lag基分块；沿lag求和后由12维约化为4维。
+    n_temperature_basis = len(beta) // lagbasis.shape[1]
+    reduction = np.hstack(
+        [weight * np.eye(n_temperature_basis) for weight in lagbasis.sum(axis=0)]
+    )
+    cumulative_beta = reduction @ beta
+    cumulative_cov = reduction @ cov @ reduction.T
+    statistic = float(
+        cumulative_beta @ np.linalg.solve(cumulative_cov, cumulative_beta)
+    )
+    return (
+        statistic,
+        n_temperature_basis,
+        float(chi2.sf(statistic, n_temperature_basis)),
+    )
+
+
+def temperature_quintile_summary(mean_utci, events, cb_at, ref, beta, cov):
+    """按全部入模人周均温分五组，平均恒温历史的log ROR后取指数。
+
+    每个人周等权；相同均温保留在同一组。CI使用平均对比向量与完整交互
+    参数协方差计算，不平均逐点CI，也不将人周视为独立参数估计。
+    """
+    quintiles, edges = pd.qcut(mean_utci, 5, labels=False, retbins=True)
+    reference_basis = cb_at(ref)[0]
+    mean_contrasts = np.zeros((5, len(beta)))
+    rows = []
+    for q in range(5):
+        selected = quintiles == q
+        temperatures = mean_utci[selected]
+        # 分块累加，避免额外分配全体人周的累计交叉基矩阵。
+        for start in range(0, len(temperatures), 8000):
+            mean_contrasts[q] += cb_at(temperatures[start : start + 8000]).sum(axis=0)
+        mean_contrasts[q] = mean_contrasts[q] / len(temperatures) - reference_basis
+        rows.append(
+            {
+                "quintile": f"Q{q + 1}",
+                "UTCI_lower_K": float(edges[q]),
+                "UTCI_upper_K": float(edges[q + 1]),
+                "mean_UTCI_K": float(temperatures.mean()),
+                "person_weeks": int(selected.sum()),
+                "PTB_events": int(events[selected].sum()),
+                "reference_K": ref,
+            }
+        )
+    summary = pd.DataFrame(rows)
+    summary["log_ROR"] = mean_contrasts @ beta
+    summary["SE_log_ROR"] = np.sqrt(
+        np.einsum("ij,jk,ik->i", mean_contrasts, cov, mean_contrasts)
+    )
+    summary[["ROR", "CI_lower", "CI_upper"]] = contrast(mean_contrasts, beta, cov)
+    return summary
 
 
 def run(d, dest, skip_standardization=False):
@@ -239,6 +293,25 @@ def run(d, dest, skip_standardization=False):
     ia = names.index("aspirin")
     wstat = float(b[ai] @ np.linalg.solve(V[np.ix_(ai, ai)], b[ai]))
     wp = float(chi2.sf(wstat, len(ai)))
+    cumulative_wstat, cumulative_df, cumulative_wp = cumulative_interaction_test(
+        b[ai], V[np.ix_(ai, ai)], lagbasis
+    )
+    interaction_tests = pd.DataFrame(
+        [
+            {
+                "test": "full_temperature_lag_interaction",
+                "chi2": wstat,
+                "df": len(ai),
+                "P": wp,
+            },
+            {
+                "test": "cumulative_temperature_interaction",
+                "chi2": cumulative_wstat,
+                "df": cumulative_df,
+                "P": cumulative_wp,
+            },
+        ]
+    )
 
     # 8. 构造累计及各lag的温度对比，计算OR、ROR和置信区间。
     def cb_at(t, k=None):
@@ -325,8 +398,11 @@ def run(d, dest, skip_standardization=False):
                 }
             )
 
-    # 9. 按孕周和温度组划分标准化OR的计算单元。
+    # 9. 汇总累计ROR五分位，并按孕周和温度组划分标准化OR计算单元。
     avg = temps.mean(axis=1)
+    quintile_summary = temperature_quintile_summary(
+        avg, y, cb_at, ref, b[ai], V[np.ix_(ai, ai)]
+    )
     q5, q95 = np.percentile(avg[informative], [5, 95])
     group = np.where(avg <= q5, "Low", np.where(avg >= q95, "High", "Mid"))
     keys = sorted(set(zip(ww, group)))
@@ -428,6 +504,15 @@ def run(d, dest, skip_standardization=False):
         "joint_interaction_chi2": wstat,
         "joint_interaction_df": 12,
         "joint_interaction_P": wp,
+        "cumulative_interaction_chi2": cumulative_wstat,
+        "cumulative_interaction_df": cumulative_df,
+        "cumulative_interaction_P": cumulative_wp,
+        "quintile_definition": (
+            "person-week mean UTCI over all modeled risk rows; ties kept together"
+        ),
+        "quintile_ROR_method": (
+            "exp(mean constant-history log ROR); CI from mean contrast covariance"
+        ),
         **likelihood_metrics,
         "converged": converged,
         "covariance": "patient-cluster sandwich",
@@ -454,6 +539,8 @@ def run(d, dest, skip_standardization=False):
             wr, sheet_name="Covariance"
         )
         cumulative.to_excel(wr, sheet_name="Cumulative_ROR", index=False)
+        interaction_tests.to_excel(wr, sheet_name="Interaction_Tests", index=False)
+        quintile_summary.to_excel(wr, sheet_name="Cumulative_ROR_Quintiles", index=False)
         pd.concat(curves).to_excel(wr, sheet_name="Temperature_Curves", index=False)
         pd.concat(heat).to_excel(wr, sheet_name="Temperature_Lag", index=False)
         pd.DataFrame(slices).to_excel(wr, sheet_name="Lag_Slices", index=False)
@@ -467,6 +554,8 @@ def run(d, dest, skip_standardization=False):
         int(y.sum()),
         "joint P=",
         wp,
+        "cumulative P=",
+        cumulative_wp,
         "seconds=",
         round(time.time() - beg),
         flush=True,
@@ -503,7 +592,7 @@ def main():
     d["早产"] = ga.lt(37).astype(int)
     # 3. 拟合主DLNM并输出一个结果汇总Excel文件。
     run(d, output, skip_standardization=args.skip_standardization)
-    print("结果已保存至：", (output / "analysis_results_revised.xlsx").resolve(), flush=True)
+    print("结果已保存至：", (output / "analysis_results.xlsx").resolve(), flush=True)
 
 
 if __name__ == "__main__":
